@@ -8,10 +8,10 @@
 package hash
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"sort"
 	"strings"
 )
 
@@ -31,21 +31,17 @@ var RedactHeaders = map[string]bool{
 	"set-cookie":          true,
 }
 
-// canonical recursively sorts object keys so semantically-equal bodies hash
-// identically regardless of field order.
+// canonical recursively canonicalizes a decoded JSON value. Objects are left as
+// maps: encoding/json marshals map keys in sorted order, which (combined with
+// HTML-escaping disabled in marshalCanonical) yields byte-identical output to
+// the TypeScript mirror's `JSON.stringify(sortedObject)`.
 func canonical(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
-		keys := make([]string, 0, len(t))
-		for k := range t {
-			keys = append(keys, k)
+		for k, val := range t {
+			t[k] = canonical(val)
 		}
-		sort.Strings(keys)
-		out := make([][2]any, 0, len(keys))
-		for _, k := range keys {
-			out = append(out, [2]any{k, canonical(t[k])})
-		}
-		return out
+		return t
 	case []any:
 		for i := range t {
 			t[i] = canonical(t[i])
@@ -54,6 +50,22 @@ func canonical(v any) any {
 	default:
 		return v
 	}
+}
+
+// marshalCanonical serializes v the same way JavaScript's JSON.stringify does:
+// sorted object keys (via map marshaling) and NO HTML escaping of <, >, &.
+func marshalCanonical(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	b := buf.Bytes()
+	if len(b) > 0 && b[len(b)-1] == '\n' {
+		b = b[:len(b)-1] // Encode appends a trailing newline
+	}
+	return b, nil
 }
 
 // stripIgnored removes dot-path fields (e.g. "metadata.request_id") from a
@@ -92,7 +104,7 @@ func Key(in Input) string {
 		for _, p := range in.IgnorePaths {
 			stripIgnored(parsed, p)
 		}
-		if b, err := json.Marshal(canonical(parsed)); err == nil {
+		if b, err := marshalCanonical(canonical(parsed)); err == nil {
 			canonicalBody = b
 		}
 	}

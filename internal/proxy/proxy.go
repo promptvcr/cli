@@ -85,6 +85,13 @@ func (s *Server) onRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Requ
 }
 
 func (s *Server) onResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+	if resp != nil {
+		// HTTP/3 mitigation: strip Alt-Svc so clients don't discover an h3/QUIC
+		// endpoint and switch to UDP/443, which this TCP+TLS proxy cannot MITM.
+		// Forcing the TCP fallback keeps all LLM traffic interceptable.
+		resp.Header.Del("Alt-Svc")
+	}
+
 	data, ok := ctx.UserData.(ctxData)
 	if !ok || resp == nil || s.mode == config.ModeReplay {
 		return resp
