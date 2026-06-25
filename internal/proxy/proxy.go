@@ -27,6 +27,7 @@ type ctxData struct {
 	key      string
 	provider string
 	reqBody  []byte
+	replayed bool // served from cache; onResponse must not re-record it
 }
 
 // Server bundles a configured goproxy with its dependencies.
@@ -86,6 +87,7 @@ func (s *Server) onRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Requ
 	if s.mode != config.ModeRecord {
 		if rec, ok := s.store.Get(provider, key); ok {
 			log.Printf("replay  %s %s  [%s]", req.Method, req.URL.Path, key[:12])
+			ctx.UserData = ctxData{key: key, provider: provider, reqBody: body, replayed: true}
 			return req, s.buildReplay(req, rec)
 		}
 		if s.mode == config.ModeReplay {
@@ -107,7 +109,7 @@ func (s *Server) onResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Re
 	}
 
 	data, ok := ctx.UserData.(ctxData)
-	if !ok || resp == nil || s.mode == config.ModeReplay {
+	if !ok || resp == nil || s.mode == config.ModeReplay || data.replayed {
 		return resp
 	}
 
