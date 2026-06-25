@@ -76,6 +76,17 @@ func TestDollars(t *testing.T) {
 	if got := Dollars(0); got != "$0.00" {
 		t.Errorf("Dollars(0) = %q", got)
 	}
+	// One cent or more stays in dollars.
+	if got := Dollars(1); got != "$0.01" {
+		t.Errorf("Dollars(1) = %q", got)
+	}
+	// Sub-cent savings render as a fractional cent, not a misleading $0.00.
+	if got := Dollars(0.10); got != "0.10¢" {
+		t.Errorf("Dollars(0.10) = %q, want 0.10¢", got)
+	}
+	if got := Dollars(0.05); got != "0.05¢" {
+		t.Errorf("Dollars(0.05) = %q, want 0.05¢", got)
+	}
 }
 
 func TestRenderText(t *testing.T) {

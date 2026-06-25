@@ -109,8 +109,20 @@ func ResetCumulative(dir string) error {
 	return err
 }
 
-// Dollars formats cents as a $X.XX string.
-func Dollars(cents float64) string { return fmt.Sprintf("$%.2f", cents/100) }
+// Dollars formats a cents value for display. Amounts of one cent or more render
+// as dollars ($X.XX); positive sub-cent amounts render as a fractional cent
+// (e.g. "0.10¢") so small-but-real savings don't collapse to a misleading
+// "$0.00"; zero (or negative) renders as "$0.00".
+func Dollars(cents float64) string {
+	switch {
+	case cents <= 0:
+		return "$0.00"
+	case cents < 1:
+		return fmt.Sprintf("%.2f¢", cents)
+	default:
+		return fmt.Sprintf("$%.2f", cents/100)
+	}
+}
 
 // View is a renderable summary, used for both a session and cumulative totals,
 // optionally augmented with store-inventory numbers.
