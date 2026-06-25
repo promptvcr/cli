@@ -1,0 +1,94 @@
+name: "PromptVCR proxy"
+description: "Record/replay LLM API calls through the PromptVCR proxy for cheap, deterministic CI. No SDK required."
+branding:
+  icon: "play-circle"
+  color: "purple"
+
+inputs:
+  version:
+    description: "CLI version to install (e.g. v0.2.0). Defaults to the latest release."
+    required: false
+    default: ""
+  mode:
+    description: "Proxy mode: replay | auto | record."
+    required: false
+    default: "replay"
+  fixtures:
+    description: "Cassette directory."
+    required: false
+    default: "fixtures"
+  proxy-port:
+    description: "Port the proxy listens on (127.0.0.1)."
+    required: false
+    default: "8889"
+  run:
+    description: "Optional command to run with the proxy active. If set, the proxy is stopped afterward so the savings summary is flushed to the job summary."
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install PromptVCR
+      shell: bash
+      env:
+        PROMPTVCR_VERSION: ${{ inputs.version }}
+        PROMPTVCR_INSTALL_DIR: ${{ runner.temp }}/promptvcr-bin
+      run: |
+        sh "$GITHUB_ACTION_PATH/scripts/install.sh"
+        echo "${{ runner.temp }}/promptvcr-bin" >> "$GITHUB_PATH"
+
+    - name: Trust CA and export proxy environment
+      shell: bash
+      run: |
+        promptvcr init --no-install
+        CA="$HOME/.promptvcr/promptvcr-ca.crt"
+        case "$RUNNER_OS" in
+          Linux)
+            sudo cp "$CA" /usr/local/share/ca-certificates/promptvcr.crt && sudo update-ca-certificates || true ;;
+          macOS)
+            sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$CA" || true ;;
+        esac
+        ADDR="127.0.0.1:${{ inputs.proxy-port }}"
+        {
+          echo "HTTPS_PROXY=http://$ADDR"
+          echo "HTTP_PROXY=http://$ADDR"
+          echo "https_proxy=http://$ADDR"
+          echo "http_proxy=http://$ADDR"
+          echo "NODE_EXTRA_CA_CERTS=$CA"
+          echo "REQUESTS_CA_BUNDLE=$CA"
+          echo "SSL_CERT_FILE=$CA"
+          echo "CURL_CA_BUNDLE=$CA"
+          echo "GIT_PROXY_COMMAND="
+        } >> "$GITHUB_ENV"
+
+    - name: Start proxy
+      shell: bash
+      run: |
+        ADDR="127.0.0.1:${{ inputs.proxy-port }}"
+        nohup promptvcr "${{ inputs.mode }}" --addr "$ADDR" --fixtures "${{ inputs.fixtures }}" \
+          > "${{ runner.temp }}/promptvcr.log" 2>&1 &
+        echo $! > "${{ runner.temp }}/promptvcr.pid"
+        for _ in $(seq 1 50); do
+          if (exec 3<>/dev/tcp/127.0.0.1/${{ inputs.proxy-port }}) 2>/dev/null; then exec 3>&- 3<&-; break; fi
+          sleep 0.2
+        done
+        echo "PromptVCR proxy started on $ADDR (mode=${{ inputs.mode }})"
+
+    - name: Run wrapped command
+      if: ${{ inputs.run != '' }}
+      shell: bash
+      env:
+        PROMPTVCR_RUN: ${{ inputs.run }}
+      run: bash -c "$PROMPTVCR_RUN"
+
+    - name: Stop proxy and flush stats
+      if: ${{ inputs.run != '' }}
+      shell: bash
+      run: |
+        PID="$(cat "${{ runner.temp }}/promptvcr.pid" 2>/dev/null || true)"
+        if [ -n "$PID" ]; then
+          kill -INT "$PID" 2>/dev/null || true
+          for _ in $(seq 1 25); do kill -0 "$PID" 2>/dev/null || break; sleep 0.2; done
+        fi
+        cat "${{ runner.temp }}/promptvcr.log" || true

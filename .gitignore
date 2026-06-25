@@ -1,0 +1,26 @@
+# Build output
+bin/
+promptvcr
+promptvcr.exe
+*.test
+dist/
+cover.out
+
+# Local fixtures + generated CA (never commit secrets or local CA keys)
+fixtures/
+.promptvcr/
+*.pem
+*.key
+*.crt
+!**/testdata/**
+
+# Env
+.env
+.env.local
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

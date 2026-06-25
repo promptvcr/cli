@@ -1,0 +1,75 @@
+# GoReleaser config for the PUBLIC promptvcr/cli repo.
+# In that repo the Go module is at the root (this overlay replaces the monorepo's
+# root .goreleaser.yaml, which builds from ./cli). Do not run this from the
+# monorepo; it is mirrored to promptvcr/cli and runs there on tag push.
+version: 2
+
+project_name: promptvcr
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: promptvcr
+    main: ./cmd/promptvcr
+    binary: promptvcr
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: default
+    ids: [promptvcr]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+# Publish the formula to promptvcr/homebrew-tap over SSH using a write deploy key
+# (no PAT needed). The release workflow writes the key file and exports
+# HOMEBREW_TAP_KEY_FILE before invoking GoReleaser.
+brews:
+  - name: promptvcr
+    ids: [default]
+    repository:
+      owner: promptvcr
+      name: homebrew-tap
+      branch: main
+      git:
+        url: "git@github.com:promptvcr/homebrew-tap.git"
+        private_key: "{{ .Env.HOMEBREW_TAP_KEY_FILE }}"
+    directory: Formula
+    homepage: "https://github.com/promptvcr/cli"
+    description: "Zero-config LLM record/replay proxy with drift detection"
+    license: "MIT"
+    commit_author:
+      name: promptvcr-bot
+      email: bot@promptvcr.dev
+    install: |
+      bin.install "promptvcr"
+    test: |
+      system "#{bin}/promptvcr", "--version"
+
+release:
+  github:
+    owner: promptvcr
+    name: cli
