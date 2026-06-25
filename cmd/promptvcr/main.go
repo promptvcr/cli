@@ -2,15 +2,22 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/promptvcr/cli/internal/ca"
 	"github.com/promptvcr/cli/internal/config"
 	"github.com/promptvcr/cli/internal/doctor"
+	"github.com/promptvcr/cli/internal/pricing"
 	"github.com/promptvcr/cli/internal/proxy"
+	"github.com/promptvcr/cli/internal/redact"
 	"github.com/promptvcr/cli/internal/sse"
+	"github.com/promptvcr/cli/internal/stats"
 	"github.com/promptvcr/cli/internal/store"
 	"github.com/promptvcr/cli/internal/sync"
 	"github.com/spf13/cobra"
@@ -35,7 +42,7 @@ func main() {
 	root.PersistentFlags().StringVar(&fixtures, "fixtures", config.FixturesDir(), "cassette directory")
 	root.PersistentFlags().StringVar(&timing, "timing", "instant", "SSE replay timing: realtime|instant|accelerated")
 
-	root.AddCommand(initCmd(), doctorCmd(), recordCmd(), replayCmd(), autoCmd(), lsCmd(), pushCmd(), uninstallCACmd())
+	root.AddCommand(initCmd(), doctorCmd(), recordCmd(), replayCmd(), autoCmd(), lsCmd(), statsCmd(), pushCmd(), uninstallCACmd())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -93,17 +100,72 @@ func doctorCmd() *cobra.Command {
 }
 
 func runProxy(mode config.Mode) error {
+	cfg := config.Load()
 	st, err := store.Open(fixtures)
 	if err != nil {
 		return err
 	}
-	srv, err := proxy.New(caDir, st, mode, parseTiming(timing))
+	st.IgnorePaths = cfg.IgnorePaths
+	red := redact.Compile(cfg.Redact.JSONPaths, cfg.Redact.Patterns, cfg.Redact.ReplaceWith)
+	prices := pricing.Load(config.Dir())
+
+	srv, err := proxy.New(caDir, st, mode, parseTiming(timing),
+		proxy.WithPricing(prices), proxy.WithRedaction(red))
 	if err != nil {
 		return fmt.Errorf("setup proxy (did you run `promptvcr init`?): %w", err)
 	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	httpSrv := &http.Server{Addr: addr, Handler: srv.Handler()}
 	fmt.Printf("promptvcr %s on http://%s  (mode=%s, fixtures=%s)\n", version, addr, mode, fixtures)
 	fmt.Printf("export HTTPS_PROXY=http://%s\n", addr)
-	return http.ListenAndServe(addr, srv.Handler())
+
+	errCh := make(chan error, 1)
+	go func() {
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errCh <- err
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		stop() // restore default signal handling so a second Ctrl-C force-quits
+		fmt.Fprintln(os.Stderr, "\nshutting down...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutdownCtx)
+		flushStats(srv.Stats())
+		return nil
+	}
+}
+
+// flushStats renders the session summary to stderr, appends a markdown table to
+// $GITHUB_STEP_SUMMARY when running in GitHub Actions, and merges the session
+// into the cumulative ~/.promptvcr/stats.json.
+func flushStats(snap stats.Snapshot) {
+	snap.View("PromptVCR session summary").WriteText(os.Stderr)
+
+	if snap.Hits+snap.Misses+snap.Records == 0 {
+		return // nothing happened; don't inflate the cumulative session count
+	}
+
+	if p := os.Getenv("GITHUB_STEP_SUMMARY"); p != "" {
+		if f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+			snap.View("PromptVCR savings").WriteMarkdown(f)
+			_ = f.Close()
+		}
+	}
+
+	dir := config.Dir()
+	cum := stats.LoadCumulative(dir)
+	cum.Add(snap)
+	if err := cum.Save(dir); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not persist stats: %v\n", err)
+	}
 }
 
 func recordCmd() *cobra.Command {
@@ -122,10 +184,14 @@ func autoCmd() *cobra.Command {
 }
 
 func lsCmd() *cobra.Command {
-	return &cobra.Command{
+	var staleDays int
+	cmd := &cobra.Command{
 		Use:   "ls",
-		Short: "List local cassettes",
+		Short: "List local cassettes (with age and STALE markers)",
 		RunE: func(_ *cobra.Command, _ []string) error {
+			if staleDays <= 0 {
+				staleDays = config.Load().StaleDays
+			}
 			st, err := store.Open(fixtures)
 			if err != nil {
 				return err
@@ -134,17 +200,118 @@ func lsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			cutoff := time.Now().AddDate(0, 0, -staleDays)
+			stale := 0
 			for _, r := range recs {
 				kind := "json"
 				if len(r.Response.Stream) > 0 {
 					kind = fmt.Sprintf("stream/%d", len(r.Response.Stream))
 				}
-				fmt.Printf("%-12s %-10s %s %s  [%s]\n", r.Key[:12], r.Provider, r.Request.Method, r.Request.Path, kind)
+				age, tag := ageAndTag(r.RecordedAt, cutoff)
+				if tag != "" {
+					stale++
+				}
+				fmt.Printf("%-12s %-10s %-4s %-28s %-11s %6s  %s\n",
+					r.Key[:12], r.Provider, r.Request.Method, r.Request.Path, kind, age, tag)
 			}
-			fmt.Printf("%d cassette(s)\n", len(recs))
+			fmt.Printf("%d cassette(s)", len(recs))
+			if stale > 0 {
+				fmt.Printf(", %d stale (older than %dd)", stale, staleDays)
+			}
+			fmt.Println()
 			return nil
 		},
 	}
+	cmd.Flags().IntVar(&staleDays, "stale-days", 0, "age in days past which a cassette is marked STALE (0 = config/default)")
+	return cmd
+}
+
+func statsCmd() *cobra.Command {
+	var ghSummary, reset bool
+	var staleDays int
+	cmd := &cobra.Command{
+		Use:          "stats",
+		Short:        "Show cumulative savings and cassette inventory",
+		SilenceUsage: true,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			dir := config.Dir()
+			if reset {
+				if err := stats.ResetCumulative(dir); err != nil {
+					return err
+				}
+				fmt.Println("Cumulative stats reset.")
+				return nil
+			}
+			if staleDays <= 0 {
+				staleDays = config.Load().StaleDays
+			}
+			cum := stats.LoadCumulative(dir)
+			view := cum.View("PromptVCR cumulative savings")
+			if st, err := store.Open(fixtures); err == nil {
+				if recs, err := st.List(); err == nil {
+					view.Cassettes = len(recs)
+					view.Stale = countStale(recs, staleDays)
+				}
+			}
+			view.WriteText(os.Stdout)
+
+			if ghSummary {
+				if p := os.Getenv("GITHUB_STEP_SUMMARY"); p != "" {
+					if f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+						view.WriteMarkdown(f)
+						_ = f.Close()
+					}
+				} else {
+					view.WriteMarkdown(os.Stdout)
+				}
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&ghSummary, "github-summary", false, "also write a markdown table to $GITHUB_STEP_SUMMARY (or stdout if unset)")
+	cmd.Flags().BoolVar(&reset, "reset", false, "reset cumulative stats")
+	cmd.Flags().IntVar(&staleDays, "stale-days", 0, "age in days past which a cassette is stale (0 = config/default)")
+	return cmd
+}
+
+// ageAndTag returns a human-readable age for a cassette and "STALE" if it was
+// recorded before cutoff.
+func ageAndTag(recordedAt string, cutoff time.Time) (age, tag string) {
+	t, err := time.Parse(time.RFC3339, recordedAt)
+	if err != nil {
+		return "?", ""
+	}
+	if t.Before(cutoff) {
+		tag = "STALE"
+	}
+	return humanizeAge(time.Since(t)), tag
+}
+
+func humanizeAge(d time.Duration) string {
+	switch days := int(d.Hours() / 24); {
+	case days >= 1:
+		return fmt.Sprintf("%dd", days)
+	case d.Hours() >= 1:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	case d.Minutes() >= 1:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	default:
+		return "new"
+	}
+}
+
+func countStale(recs []*store.Record, staleDays int) int {
+	if staleDays <= 0 {
+		staleDays = config.DefaultStaleDays
+	}
+	cutoff := time.Now().AddDate(0, 0, -staleDays)
+	n := 0
+	for _, r := range recs {
+		if t, err := time.Parse(time.RFC3339, r.RecordedAt); err == nil && t.Before(cutoff) {
+			n++
+		}
+	}
+	return n
 }
 
 func pushCmd() *cobra.Command {

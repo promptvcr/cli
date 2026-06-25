@@ -176,7 +176,7 @@ func verifyTrust(caDir, host string) Check {
 	if err != nil {
 		return Check{Name: name, Status: Warn, Detail: "could not create temp dir: " + err.Error()}
 	}
-	defer os.RemoveAll(tmp)
+	defer func() { _ = os.RemoveAll(tmp) }()
 
 	st, err := store.Open(tmp)
 	if err != nil {

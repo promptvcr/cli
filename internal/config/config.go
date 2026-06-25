@@ -2,10 +2,49 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// DefaultStaleDays is the cassette age (in days) past which `ls`/`stats` flag a
+// cassette as stale, unless overridden by config or a flag.
+const DefaultStaleDays = 30
+
+// RedactRules configures value masking before cassettes are written.
+type RedactRules struct {
+	JSONPaths   []string `json:"jsonPaths,omitempty"`
+	Patterns    []string `json:"patterns,omitempty"`
+	ReplaceWith string   `json:"replaceWith,omitempty"`
+}
+
+// File is the on-disk schema for .promptvcr.json / ~/.promptvcr/config.json.
+type File struct {
+	IgnorePaths []string    `json:"ignorePaths,omitempty"`
+	StaleDays   int         `json:"staleDays,omitempty"`
+	Redact      RedactRules `json:"redact,omitempty"`
+}
+
+// Load reads configuration, applying ~/.promptvcr/config.json first and then
+// ./.promptvcr.json on top (project settings win, field by field). Missing or
+// malformed files are ignored. StaleDays defaults to DefaultStaleDays.
+func Load() File {
+	cfg := File{StaleDays: DefaultStaleDays}
+	apply := func(path string) {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return
+		}
+		_ = json.Unmarshal(b, &cfg) // unmarshal overlays present fields onto cfg
+	}
+	apply(filepath.Join(Dir(), "config.json"))
+	apply(".promptvcr.json")
+	if cfg.StaleDays <= 0 {
+		cfg.StaleDays = DefaultStaleDays
+	}
+	return cfg
+}
 
 // Mode controls proxy behavior.
 type Mode string

@@ -1,0 +1,29 @@
+# Shared by this monorepo's CI (run with working-directory: cli) and the public
+# promptvcr/cli repo (where this file lands at the module root via the mirror).
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - misspell
+  settings:
+    errcheck:
+      # Writes to stdout/stderr/string builders and deferred Close() cleanups
+      # have no actionable error path; ignoring them is idiomatic here.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (io.Closer).Close
+        - (*os.File).Close
+
+formatters:
+  enable:
+    - gofmt
