@@ -65,6 +65,20 @@ func Ensure(dir string) error {
 	return writePEM(keyPath, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(priv), 0o600)
 }
 
+// Load reads and parses the root CA certificate from dir.
+func Load(dir string) (*x509.Certificate, error) {
+	certPath, _ := Paths(dir)
+	pemBytes, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		return nil, fmt.Errorf("no PEM block in %s", certPath)
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
+
 // Install adds the CA to the OS trust store. Some runtimes (Node, Python) keep
 // their own bundle; Hints() prints the env vars to point them at our CA.
 func Install(dir string) error {

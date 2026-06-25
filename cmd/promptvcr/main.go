@@ -8,6 +8,7 @@ import (
 
 	"github.com/promptvcr/cli/internal/ca"
 	"github.com/promptvcr/cli/internal/config"
+	"github.com/promptvcr/cli/internal/doctor"
 	"github.com/promptvcr/cli/internal/proxy"
 	"github.com/promptvcr/cli/internal/sse"
 	"github.com/promptvcr/cli/internal/store"
@@ -34,7 +35,7 @@ func main() {
 	root.PersistentFlags().StringVar(&fixtures, "fixtures", config.FixturesDir(), "cassette directory")
 	root.PersistentFlags().StringVar(&timing, "timing", "instant", "SSE replay timing: realtime|instant|accelerated")
 
-	root.AddCommand(initCmd(), recordCmd(), replayCmd(), autoCmd(), lsCmd(), pushCmd(), uninstallCACmd())
+	root.AddCommand(initCmd(), doctorCmd(), recordCmd(), replayCmd(), autoCmd(), lsCmd(), pushCmd(), uninstallCACmd())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -68,6 +69,26 @@ func initCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&skipInstall, "no-install", false, "generate the CA but do not modify the OS trust store")
+	return cmd
+}
+
+func doctorCmd() *cobra.Command {
+	var verify bool
+	cmd := &cobra.Command{
+		Use:   "doctor",
+		Short: "Diagnose CA, trust, and proxy setup",
+		// A failing check is a diagnostic result, not a usage error.
+		SilenceUsage: true,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			checks := doctor.Run(doctor.Options{CADir: caDir, ProxyAddr: addr, Verify: verify})
+			doctor.Render(os.Stdout, checks)
+			if !doctor.OK(checks) {
+				return fmt.Errorf("one or more checks failed")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&verify, "verify", false, "perform a live TLS-MITM handshake to confirm the OS trusts the CA")
 	return cmd
 }
 
