@@ -2,16 +2,20 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/promptvcr/cli/internal/ca"
 	"github.com/promptvcr/cli/internal/config"
+	"github.com/promptvcr/cli/internal/credentials"
 	"github.com/promptvcr/cli/internal/doctor"
 	"github.com/promptvcr/cli/internal/pricing"
 	"github.com/promptvcr/cli/internal/proxy"
@@ -42,7 +46,8 @@ func main() {
 	root.PersistentFlags().StringVar(&fixtures, "fixtures", config.FixturesDir(), "cassette directory")
 	root.PersistentFlags().StringVar(&timing, "timing", "instant", "SSE replay timing: realtime|instant|accelerated")
 
-	root.AddCommand(initCmd(), doctorCmd(), recordCmd(), replayCmd(), autoCmd(), lsCmd(), statsCmd(), pushCmd(), uninstallCACmd())
+	root.AddCommand(initCmd(), doctorCmd(), recordCmd(), replayCmd(), autoCmd(), lsCmd(), statsCmd(),
+		loginCmd(), logoutCmd(), cloudLsCmd(), pullCmd(), pushCmd(), uninstallCACmd())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -316,14 +321,10 @@ func countStale(recs []*store.Record, staleDays int) int {
 
 func pushCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "push",
-		Short: "Upload local cassettes to the cloud vault",
+		Use:          "push",
+		Short:        "Upload local cassettes to the cloud vault",
+		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			base, key, token, team := os.Getenv("PROMPTVCR_SUPABASE_URL"), os.Getenv("PROMPTVCR_SUPABASE_ANON_KEY"),
-				os.Getenv("PROMPTVCR_TOKEN"), os.Getenv("PROMPTVCR_TEAM_ID")
-			if base == "" || key == "" || token == "" || team == "" {
-				return fmt.Errorf("set PROMPTVCR_SUPABASE_URL, PROMPTVCR_SUPABASE_ANON_KEY, PROMPTVCR_TOKEN, PROMPTVCR_TEAM_ID")
-			}
 			st, err := store.Open(fixtures)
 			if err != nil {
 				return err
@@ -332,11 +333,236 @@ func pushCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+
+			// Prefer the saved PAT login when present; fall back to the legacy
+			// env-based JWT/team flow.
+			if creds, err := credentials.Load(); err == nil && strings.HasPrefix(creds.Token, "pvcr_") {
+				base, key := resolveEndpoint(creds)
+				if base == "" || key == "" {
+					return fmt.Errorf("missing Supabase URL/api-key: re-run `promptvcr login` with --url/--api-key")
+				}
+				n, err := sync.NewWithToken(base, key, creds.Token).PushAll(recs)
+				fmt.Printf("pushed %d/%d cassette(s)\n", n, len(recs))
+				return err
+			}
+
+			base, key, token, team := os.Getenv("PROMPTVCR_SUPABASE_URL"), os.Getenv("PROMPTVCR_SUPABASE_ANON_KEY"),
+				os.Getenv("PROMPTVCR_TOKEN"), os.Getenv("PROMPTVCR_TEAM_ID")
+			if base == "" || key == "" || token == "" || team == "" {
+				return fmt.Errorf("not logged in: run `promptvcr login`, or set PROMPTVCR_SUPABASE_URL, PROMPTVCR_SUPABASE_ANON_KEY, PROMPTVCR_TOKEN, PROMPTVCR_TEAM_ID")
+			}
 			n, err := sync.New(base, key, token, team).PushAll(recs)
 			fmt.Printf("pushed %d/%d cassette(s)\n", n, len(recs))
 			return err
 		},
 	}
+}
+
+// resolveEndpoint returns the Supabase URL and api-key, preferring saved
+// credentials and falling back to the PROMPTVCR_SUPABASE_* env vars.
+func resolveEndpoint(creds credentials.Credentials) (url, apiKey string) {
+	url, apiKey = creds.URL, creds.APIKey
+	if url == "" {
+		url = os.Getenv("PROMPTVCR_SUPABASE_URL")
+	}
+	if apiKey == "" {
+		apiKey = os.Getenv("PROMPTVCR_SUPABASE_ANON_KEY")
+	}
+	return url, apiKey
+}
+
+// cloudClient builds a token-authed sync client from saved credentials,
+// erroring with actionable guidance when the login is incomplete.
+func cloudClient() (*sync.Client, error) {
+	creds, err := credentials.Load()
+	if err != nil {
+		return nil, err
+	}
+	if creds.Token == "" {
+		return nil, fmt.Errorf("not logged in: run `promptvcr login`")
+	}
+	base, key := resolveEndpoint(creds)
+	if base == "" || key == "" {
+		return nil, fmt.Errorf("missing Supabase URL/api-key: re-run `promptvcr login` with --url/--api-key")
+	}
+	return sync.NewWithToken(base, key, creds.Token), nil
+}
+
+func loginCmd() *cobra.Command {
+	var url, apiKey, token string
+	cmd := &cobra.Command{
+		Use:          "login",
+		Short:        "Save cloud credentials (Supabase URL, api-key, and access token)",
+		SilenceUsage: true,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if url == "" {
+				url = os.Getenv("PROMPTVCR_SUPABASE_URL")
+			}
+			if apiKey == "" {
+				apiKey = os.Getenv("PROMPTVCR_SUPABASE_ANON_KEY")
+			}
+			if url == "" || apiKey == "" {
+				return fmt.Errorf("provide --url and --api-key (or set PROMPTVCR_SUPABASE_URL / PROMPTVCR_SUPABASE_ANON_KEY)")
+			}
+			if token == "" {
+				fmt.Print("Paste your PromptVCR access token: ")
+				line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+				if err != nil && line == "" {
+					return fmt.Errorf("read token: %w", err)
+				}
+				token = strings.TrimSpace(line)
+			}
+			if token == "" {
+				return fmt.Errorf("no token provided")
+			}
+
+			creds := credentials.Credentials{URL: url, APIKey: apiKey, Token: token}
+			if err := credentials.Save(creds); err != nil {
+				return err
+			}
+			fmt.Printf("Saved credentials to %s\n", credentials.Path())
+
+			// Verify the token works by hitting cli_list_fixtures; a failure is a
+			// warning, not fatal, since the credentials are already persisted.
+			if _, err := sync.NewWithToken(url, apiKey, token).ListCloud(); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not verify token: %v\n", err)
+			} else {
+				fmt.Println("Token verified.")
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&url, "url", "", "Supabase project URL (or PROMPTVCR_SUPABASE_URL)")
+	cmd.Flags().StringVar(&apiKey, "api-key", "", "Supabase anon/publishable key (or PROMPTVCR_SUPABASE_ANON_KEY)")
+	cmd.Flags().StringVar(&token, "token", "", "PromptVCR access token (pvcr_...); prompted if omitted")
+	return cmd
+}
+
+func logoutCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "logout",
+		Short:        "Remove saved cloud credentials",
+		SilenceUsage: true,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if err := credentials.Clear(); err != nil {
+				return err
+			}
+			fmt.Println("Logged out.")
+			return nil
+		},
+	}
+}
+
+func cloudLsCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "cloud-ls",
+		Short:        "List cassettes stored in the cloud vault",
+		SilenceUsage: true,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			client, err := cloudClient()
+			if err != nil {
+				return err
+			}
+			list, err := client.ListCloud()
+			if err != nil {
+				return err
+			}
+			for _, f := range list {
+				watch := ""
+				if f.Watch {
+					watch = "watch"
+				}
+				updated := f.UpdatedAt
+				if updated == "" {
+					updated = f.RecordedAt
+				}
+				fmt.Printf("%-28s %-10s %-20s %-6s %s\n", f.Name, f.Provider, f.Model, watch, updated)
+			}
+			fmt.Printf("%d cloud cassette(s)\n", len(list))
+			return nil
+		},
+	}
+}
+
+func pullCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "pull [cache_key]",
+		Short:        "Download cloud cassettes into the local store",
+		Args:         cobra.MaximumNArgs(1),
+		SilenceUsage: true,
+		RunE: func(_ *cobra.Command, args []string) error {
+			client, err := cloudClient()
+			if err != nil {
+				return err
+			}
+			st, err := store.Open(fixtures)
+			if err != nil {
+				return err
+			}
+
+			var keys []string
+			if len(args) == 1 {
+				keys = []string{args[0]}
+			} else {
+				list, err := client.ListCloud()
+				if err != nil {
+					return err
+				}
+				for _, f := range list {
+					keys = append(keys, f.CacheKey)
+				}
+			}
+
+			n := 0
+			for _, key := range keys {
+				pf, err := client.Pull(key)
+				if err != nil {
+					return fmt.Errorf("pull %s: %w", key, err)
+				}
+				rec, err := recordFromPull(pf)
+				if err != nil {
+					return fmt.Errorf("pull %s: %w", key, err)
+				}
+				if err := st.Put(rec); err != nil {
+					return fmt.Errorf("save %s: %w", key, err)
+				}
+				n++
+			}
+			fmt.Printf("pulled %d cassette(s)\n", n)
+			return nil
+		},
+	}
+}
+
+// recordFromPull converts a cloud fixture into a local store.Record. The
+// request/response payloads are stored as the marshaled store types, so they
+// unmarshal directly back into them.
+func recordFromPull(pf *sync.PulledFixture) (*store.Record, error) {
+	rec := &store.Record{
+		Key:        pf.CacheKey,
+		Provider:   pf.Provider,
+		Model:      pf.Model,
+		TTFTMs:     pf.TTFTMs,
+		RecordedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	if len(pf.Request) > 0 {
+		if err := json.Unmarshal(pf.Request, &rec.Request); err != nil {
+			return nil, fmt.Errorf("decode request: %w", err)
+		}
+	}
+	if len(pf.Response) > 0 {
+		if err := json.Unmarshal(pf.Response, &rec.Response); err != nil {
+			return nil, fmt.Errorf("decode response: %w", err)
+		}
+	}
+	// Fall back to the top-level host/path when the request body lacked them.
+	if rec.Request.Host == "" {
+		rec.Request.Host = pf.Host
+	}
+	if rec.Request.Path == "" {
+		rec.Request.Path = pf.Path
+	}
+	return rec, nil
 }
 
 func uninstallCACmd() *cobra.Command {
