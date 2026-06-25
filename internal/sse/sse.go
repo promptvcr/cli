@@ -1,5 +1,11 @@
 // Package sse records and replays Server-Sent Events / NDJSON streams with
 // per-chunk timing fidelity.
+//
+// Recording is provider-faithful: it preserves the SSE `event:` name alongside
+// the `data:` payload (Anthropic dispatches on event names), and on replay it
+// reproduces the exact framing — including the provider's own terminator frame
+// (`data: [DONE]` for OpenAI, `event: message_stop` for Anthropic) — rather than
+// synthesizing an OpenAI-shaped `[DONE]`.
 package sse
 
 import (
@@ -22,7 +28,8 @@ const (
 )
 
 // Recorder wraps an upstream stream body, forwarding bytes to the client
-// unchanged while capturing each data chunk with its offset from the first byte.
+// unchanged while capturing each event (SSE frame or NDJSON line) with its
+// offset from the first byte.
 type Recorder struct {
 	src    io.ReadCloser
 	reader *bufio.Reader
@@ -31,6 +38,11 @@ type Recorder struct {
 	once   sync.Once
 	onDone func([]store.Chunk)
 	buf    strings.Builder
+
+	// In-progress SSE frame (flushed on a blank line or EOF).
+	curEvent string
+	curData  []string
+	inFrame  bool
 }
 
 // NewRecorder tees src, invoking onDone with the captured chunks at EOF.
@@ -49,7 +61,7 @@ func (r *Recorder) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// scan accumulates bytes and emits a chunk per complete `data:` line.
+// scan processes whole lines, buffering any trailing partial line.
 func (r *Recorder) scan(b []byte) {
 	r.buf.Write(b)
 	s := r.buf.String()
@@ -58,21 +70,71 @@ func (r *Recorder) scan(b []byte) {
 		if idx < 0 {
 			break
 		}
-		line := strings.TrimSpace(s[:idx])
+		line := strings.TrimRight(s[:idx], "\r")
 		s = s[idx+1:]
-		if data, ok := extractData(line); ok {
-			r.chunks = append(r.chunks, store.Chunk{
-				OffsetMs: time.Since(r.start).Milliseconds(),
-				Data:     data,
-			})
-		}
+		r.processLine(line)
 	}
 	r.buf.Reset()
 	r.buf.WriteString(s)
 }
 
+// processLine handles one SSE field line, NDJSON object line, or blank delimiter.
+func (r *Recorder) processLine(line string) {
+	if line == "" { // blank line: dispatch the accumulated SSE frame
+		r.dispatchFrame()
+		return
+	}
+	if strings.HasPrefix(line, ":") { // SSE comment / keep-alive
+		return
+	}
+	trimmed := strings.TrimSpace(line)
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		// NDJSON: each line is a complete event with no SSE framing.
+		r.emit("", trimmed)
+		return
+	}
+
+	field, value := splitField(line)
+	switch field {
+	case "data":
+		r.curData = append(r.curData, value)
+		r.inFrame = true
+	case "event":
+		r.curEvent = value
+		r.inFrame = true
+	case "id", "retry":
+		r.inFrame = true // part of the frame; value not needed for replay
+	default:
+		// Unknown field: ignore, per the SSE spec.
+	}
+}
+
+func (r *Recorder) dispatchFrame() {
+	if !r.inFrame {
+		return
+	}
+	if len(r.curData) > 0 {
+		r.emit(r.curEvent, strings.Join(r.curData, "\n"))
+	}
+	r.curEvent = ""
+	r.curData = nil
+	r.inFrame = false
+}
+
+func (r *Recorder) emit(event, data string) {
+	r.chunks = append(r.chunks, store.Chunk{
+		OffsetMs: time.Since(r.start).Milliseconds(),
+		Event:    event,
+		Data:     data,
+	})
+}
+
 func (r *Recorder) finish() {
 	r.once.Do(func() {
+		if rem := strings.TrimRight(r.buf.String(), "\r\n"); rem != "" {
+			r.processLine(rem)
+		}
+		r.dispatchFrame()
 		if r.onDone != nil {
 			r.onDone(r.chunks)
 		}
@@ -84,20 +146,25 @@ func (r *Recorder) Close() error {
 	return r.src.Close()
 }
 
-// extractData pulls the payload from an SSE `data:` line or a raw NDJSON object.
-func extractData(line string) (string, bool) {
-	if strings.HasPrefix(line, "data:") {
-		return strings.TrimSpace(strings.TrimPrefix(line, "data:")), true
+// splitField parses an SSE "field: value" line, stripping a single optional
+// space after the colon (per the SSE spec).
+func splitField(line string) (field, value string) {
+	idx := strings.IndexByte(line, ':')
+	if idx < 0 {
+		return line, ""
 	}
-	if strings.HasPrefix(line, "{") {
-		return line, true
-	}
-	return "", false
+	field = line[:idx]
+	value = line[idx+1:]
+	value = strings.TrimPrefix(value, " ")
+	return field, value
 }
 
-// Replay writes recorded chunks to w as an SSE stream, honoring the timing mode.
+// Replay writes recorded chunks to w, honoring the timing mode. When ndjson is
+// true each chunk is emitted as a bare JSON line; otherwise SSE framing is used
+// (an `event:` line when present, followed by `data:` line(s)). No synthetic
+// terminator is appended — the provider's own terminator was recorded.
 // accelFactor is used only when mode == Accelerated.
-func Replay(w io.Writer, flush func(), chunks []store.Chunk, mode TimingMode, accelFactor float64) {
+func Replay(w io.Writer, flush func(), chunks []store.Chunk, mode TimingMode, accelFactor float64, ndjson bool) {
 	var prev int64
 	for _, c := range chunks {
 		switch mode {
@@ -116,13 +183,20 @@ func Replay(w io.Writer, flush func(), chunks []store.Chunk, mode TimingMode, ac
 			// no delay
 		}
 		prev = c.OffsetMs
-		_, _ = io.WriteString(w, "data: "+c.Data+"\n\n")
+
+		if ndjson {
+			_, _ = io.WriteString(w, c.Data+"\n")
+		} else {
+			if c.Event != "" {
+				_, _ = io.WriteString(w, "event: "+c.Event+"\n")
+			}
+			for _, dl := range strings.Split(c.Data, "\n") {
+				_, _ = io.WriteString(w, "data: "+dl+"\n")
+			}
+			_, _ = io.WriteString(w, "\n")
+		}
 		if flush != nil {
 			flush()
 		}
-	}
-	_, _ = io.WriteString(w, "data: [DONE]\n\n")
-	if flush != nil {
-		flush()
 	}
 }

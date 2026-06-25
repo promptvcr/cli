@@ -12,8 +12,11 @@ import (
 )
 
 // Chunk is one recorded SSE/NDJSON event with its offset from the first byte.
+// Event is the SSE event name (e.g. Anthropic's "content_block_delta"); it is
+// empty for NDJSON lines and OpenAI-style data-only frames.
 type Chunk struct {
 	OffsetMs int64  `json:"offsetMs"`
+	Event    string `json:"event,omitempty"`
 	Data     string `json:"data"`
 }
 

@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/elazarl/goproxy"
@@ -44,7 +45,15 @@ func New(caDir string, st *store.Store, mode config.Mode, timing sse.TimingMode)
 	p := goproxy.NewProxyHttpServer()
 	s := &Server{proxy: p, store: st, mode: mode, timing: timing}
 
-	p.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	// Only MITM (decrypt) traffic to known LLM provider hosts; everything else is
+	// tunneled untouched. This avoids decrypting unrelated HTTPS in a CI pipeline
+	// and never breaks cert-pinned clients that aren't talking to a provider.
+	p.OnRequest().HandleConnectFunc(func(host string, _ *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+		if config.ProviderFor(host) != "" {
+			return goproxy.MitmConnect, host
+		}
+		return goproxy.OkConnect, host
+	})
 	p.OnRequest().DoFunc(s.onRequest)
 	p.OnResponse().DoFunc(s.onResponse)
 	return s, nil
@@ -62,6 +71,11 @@ func (s *Server) onRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Requ
 	body, _ := io.ReadAll(req.Body)
 	_ = req.Body.Close()
 	req.Body = io.NopCloser(bytes.NewReader(body))
+
+	// Force uncompressed upstream responses so recorded bodies are stored as plain,
+	// human-readable JSON and record/replay never has to round-trip gzip/br. Only
+	// affects live/record paths; cache hits return before forwarding.
+	req.Header.Set("Accept-Encoding", "identity")
 
 	key := hash.Key(hash.Input{
 		Method: req.Method, Host: req.URL.Host, Path: req.URL.Path,
@@ -157,13 +171,18 @@ func (s *Server) buildReplay(req *http.Request, rec *store.Record) *http.Respons
 	}
 
 	if len(rec.Response.Stream) > 0 {
-		header.Set("Content-Type", "text/event-stream")
+		ct := header.Get("Content-Type")
+		ndjson := strings.Contains(ct, "application/x-ndjson")
+		if ct == "" {
+			ct = "text/event-stream"
+		}
+		header.Set("Content-Type", ct)
 		header.Set("Cache-Control", "no-cache")
 		header.Del("Content-Length")
 		header.Del("Content-Encoding")
 		pr, pw := io.Pipe()
 		go func() {
-			sse.Replay(pw, nil, rec.Response.Stream, s.timing, 10)
+			sse.Replay(pw, nil, rec.Response.Stream, s.timing, 10, ndjson)
 			_ = pw.Close()
 		}()
 		resp.Body = pr

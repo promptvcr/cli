@@ -28,6 +28,26 @@ func TestKeyParityWithTypeScript(t *testing.T) {
 	}
 }
 
+// hardGolden is produced by the TypeScript mirror (drift-core hash.test.ts,
+// "matches the Go mirror on hard canonicalization cases"). It exercises
+// U+2028/U+2029 (Go escapes these; JS does not), non-ASCII, HTML chars, floats,
+// and large integers. Recompute in BOTH languages if the algorithm changes.
+const hardGolden = "72f4e7916268d66255c376ff55a730aea49c2605ef8257eabe4c27f2c6ca5771"
+
+func TestKeyParityWithTypeScript_HardCases(t *testing.T) {
+	// Note the literal \u2028 / \u2029 runes and embedded non-ASCII + HTML chars.
+	body := []byte("{\"z\":1,\"a\":2,\"text\":\"a\u2028b\u2029c <tag> & \\\"q\\\" 中é\",\"temp\":0.7,\"max_tokens\":1024,\"big\":1000000000000,\"nested\":{\"y\":[3,2,1],\"x\":null}}")
+	got := Key(Input{
+		Method: "post",
+		Host:   "api.openai.com",
+		Path:   "/v1/chat/completions",
+		Body:   body,
+	})
+	if got != hardGolden {
+		t.Fatalf("cross-language key mismatch on hard cases:\n  got    %s\n  golden %s", got, hardGolden)
+	}
+}
+
 func TestKeyIsOrderIndependent(t *testing.T) {
 	a := Key(Input{Method: "POST", Host: "h", Path: "/p", Body: []byte(`{"a":1,"b":2}`)})
 	b := Key(Input{Method: "POST", Host: "h", Path: "/p", Body: []byte(`{"b":2,"a":1}`)})

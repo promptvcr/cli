@@ -65,6 +65,11 @@ func marshalCanonical(v any) ([]byte, error) {
 	if len(b) > 0 && b[len(b)-1] == '\n' {
 		b = b[:len(b)-1] // Encode appends a trailing newline
 	}
+	// Go's encoder escapes U+2028/U+2029 unconditionally (SetEscapeHTML(false)
+	// does NOT disable this); JS JSON.stringify emits them raw. Unescape so the
+	// canonical bytes are byte-identical to the TypeScript mirror.
+	b = bytes.ReplaceAll(b, []byte(`\u2028`), []byte("\u2028"))
+	b = bytes.ReplaceAll(b, []byte(`\u2029`), []byte("\u2029"))
 	return b, nil
 }
 
